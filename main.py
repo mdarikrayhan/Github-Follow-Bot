@@ -10,12 +10,13 @@ The follow/unfollow lists are discovered automatically from the project root
 (any ``*_followers.txt`` or ``*_following.txt`` file).
 """
 import argparse
-import json
 import os
 import random
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from tqdm import tqdm
@@ -24,6 +25,11 @@ import ghclient
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 TARGETS_PATTERN = re.compile(r".+_follow(?:ers|ing)\.txt$")
+
+# Concurrent page fetches during harvest. GitHub's followers/following lists
+# support numbered pagination, so pages can be pulled in parallel rather than
+# one-at-a-time — the difference between latency-bound and rate-limit-bound.
+HARVEST_WORKERS = 10
 
 
 # --------------------------------------------------------------------------- #
@@ -71,50 +77,39 @@ def get_user(session, user):
     return response.json()
 
 
-def iter_pages(session, user, kind, start_url=None, on_retry=None):
-    """Yield (logins, next_url) per page of `user`'s `kind` list.
+def _fetch_page(session, user, kind, page, on_retry=None):
+    """Fetch one page (up to 100 logins) of `user`'s `kind` list by page number.
 
-    Starts at `start_url` when resuming, otherwise the first page. Each yielded
-    `next_url` is the cursor to checkpoint once the page is safely on disk.
+    Uses numbered pagination so pages are independent and fetchable in parallel.
     Idempotent GETs get a higher retry budget than the default.
     """
-    url = start_url or f"{ghclient.API_BASE}/users/{user}/{kind}"
-    params = None if start_url else {"per_page": 100}
-    while url:
-        response = ghclient.request(session, "GET", url, params=params,
-                                    max_retries=8, on_retry=on_retry)
-        response.raise_for_status()
-        logins = [entry["login"] for entry in response.json()]
-        next_url = response.links.get("next", {}).get("url")
-        yield logins, next_url
-        url = next_url
-        params = None  # subsequent page URLs already carry the query string
+    response = ghclient.request(
+        session, "GET", f"{ghclient.API_BASE}/users/{user}/{kind}",
+        params={"per_page": 100, "page": page},
+        max_retries=8, on_retry=on_retry,
+    )
+    response.raise_for_status()
+    return [entry["login"] for entry in response.json()]
 
 
 class _Counter:
-    """A callable that counts how many times it was invoked (for on_retry)."""
+    """A thread-safe callable that counts how many times it was invoked."""
     def __init__(self):
         self.count = 0
+        self._lock = threading.Lock()
 
     def __call__(self):
-        self.count += 1
+        with self._lock:
+            self.count += 1
 
 
-def _load_state(path):
-    """Return saved harvest state dict, or None if absent/unreadable."""
+def _count_lines(path):
+    """Return how many lines `path` already has (0 if it doesn't exist)."""
     try:
-        with open(path, encoding="utf-8") as handle:
-            return json.load(handle)
-    except (OSError, ValueError):
-        return None
-
-
-def _save_state(path, data):
-    """Atomically write harvest state (temp file + os.replace)."""
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(data, handle)
-    os.replace(tmp, path)
+        with open(path, "rb") as handle:
+            return sum(1 for _ in handle)
+    except FileNotFoundError:
+        return 0
 
 
 def _remove(path):
@@ -125,43 +120,77 @@ def _remove(path):
         pass
 
 
-def _harvest_one(session, user, kind, total, outfile, fresh=False):
-    """Harvest one list into `outfile`, resuming from `<outfile>.state` if present."""
-    statefile = f"{outfile}.state"
-    state = None if fresh else _load_state(statefile)
-    resuming = bool(state) and bool(state.get("next_url")) and os.path.exists(outfile)
-    if not resuming:
-        _remove(statefile)  # stale or fresh start — drop any leftover cursor
+def _harvest_one(session, user, kind, total, outfile, fresh=False, workers=HARVEST_WORKERS):
+    """Harvest one list into `outfile`, fetching `workers` pages concurrently.
 
-    start_url = state["next_url"] if resuming else None
-    saved = state["saved"] if resuming else 0
+    The output file is its own checkpoint: each line is one username, so a re-run
+    resumes from `<lines>/100 + 1`. Stopped runs (Ctrl-C, crash, or a page that
+    fails every retry) just need to be re-run. `fresh=True` starts the list over.
+    """
+    _remove(f"{outfile}.state")  # legacy cursor file from the old sequential harvester
+    if fresh:
+        _remove(outfile)
 
-    if resuming:
+    saved = _count_lines(outfile)
+    total_pages = (total + 99) // 100 if total else None
+
+    if total and saved >= total:
+        print(f"\n{outfile} already has {saved} {kind} — nothing to do.")
+        return 0
+    if saved:
         print(f"\nResuming {user}'s {kind} from {saved} already saved → {outfile}...")
     else:
-        print(f"\n{user} has {total} {kind}, fetching to {outfile}...")
+        print(f"\n{user} has {total} {kind}, fetching to {outfile} "
+              f"({workers} workers)...")
 
+    next_page = saved // 100 + 1
     retries = _Counter()
+    error = None
+    interrupted = False
+    pool = ThreadPoolExecutor(max_workers=max(1, workers))
     try:
-        with open(outfile, "a" if resuming else "w", encoding="utf-8") as handle, \
+        with open(outfile, "a", encoding="utf-8") as handle, \
                 tqdm(total=total, initial=saved, unit="user") as bar:
-            for logins, next_url in iter_pages(session, user, kind,
-                                               start_url=start_url, on_retry=retries):
-                handle.write("".join(login + "\n" for login in logins))
+            done = False
+            while not done:
+                pages = [p for p in range(next_page, next_page + workers)
+                         if total_pages is None or p <= total_pages]
+                if not pages:
+                    break
+                # Submit the whole batch at once, then consume results in page
+                # order so the file stays ordered and the resume point is exact.
+                futures = {p: pool.submit(_fetch_page, session, user, kind, p, retries)
+                           for p in pages}
+                for p in pages:
+                    try:
+                        logins = futures[p].result()
+                    except requests.exceptions.HTTPError as exc:
+                        error = exc
+                        break
+                    if not logins:          # past the last page → finished
+                        done = True
+                        break
+                    handle.write("".join(login + "\n" for login in logins))
+                    saved += len(logins)
+                    bar.update(len(logins))
+                    next_page = p + 1
                 handle.flush()
-                saved += len(logins)
-                bar.update(len(logins))
-                _save_state(statefile, {"next_url": next_url, "saved": saved})
+                if error:
+                    break
     except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    if interrupted:
         print(f"\nStopped — re-run to resume {kind} from {saved} ({outfile}).",
               file=sys.stderr)
         return 130
-    except requests.exceptions.HTTPError as exc:
-        print(f"\nStopped after an API error ({exc}); re-run to resume {kind} "
+    if error is not None:
+        print(f"\nStopped after an API error ({error}); re-run to resume {kind} "
               f"from {saved} ({outfile}).", file=sys.stderr)
         return 1
 
-    _remove(statefile)
     summary = f"Saved {saved} usernames to {outfile}"
     if retries.count:
         summary += f" (recovered from {retries.count} transient server errors)"
@@ -190,7 +219,7 @@ def harvest(args):
         for list_kind in kinds:
             outfile = args.out if (args.out and kind != "both") else f"{user}_{list_kind}.txt"
             rc = _harvest_one(session, user, list_kind, profile.get(list_kind, 0),
-                              outfile, fresh=args.fresh)
+                              outfile, fresh=args.fresh, workers=args.workers)
             if rc != 0:
                 return rc
     finally:
@@ -319,6 +348,9 @@ def parse_args(argv=None):
     parser.add_argument(
         "--fresh", action="store_true",
         help="for harvest, ignore any saved progress and start the list over")
+    parser.add_argument(
+        "--workers", type=int, default=HARVEST_WORKERS,
+        help="concurrent page fetches during harvest (default: %(default)s)")
     parser.add_argument(
         "--min-delay", type=float, default=1.0,
         help="minimum seconds to wait between follow/unfollow requests (default: %(default)s)")

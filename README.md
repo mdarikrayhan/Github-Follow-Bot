@@ -15,12 +15,13 @@ This project is published **for educational purposes only**. Use it on **your ow
 ## Features
 
 - **One interactive script** — run `python main.py` and choose `harvest`, `follow`, or `unfollow`. There is **no default action**, so you can't trigger a mass change by accident.
-- **Harvest followers or following** — pull a public GitHub user's complete **followers** and/or **following** list into a plain-text file, streamed to disk page-by-page so an interrupted run keeps what it already fetched.
-- **Resumable harvests** — each page is checkpointed, so a run stopped by `Ctrl-C`, a crash, or a hard API failure picks up where it left off when you re-run it (no re-fetching). Handy for accounts with hundreds of thousands of followers.
+- **Harvest followers or following** — pull a public GitHub user's complete **followers** and/or **following** list into a plain-text file, streamed to disk as it arrives so an interrupted run keeps what it already fetched.
+- **Fast, parallel harvest** — pages are fetched concurrently by page number (`--workers` at a time, default 10) rather than one-at-a-time, which makes a large harvest rate-limit-bound instead of latency-bound — often a 10×+ speedup on accounts with hundreds of thousands of followers.
+- **Resumable harvests** — the output file *is* the checkpoint (one username per line), so a run stopped by `Ctrl-C`, a crash, or a hard API failure picks up from where it left off when you re-run it (no re-fetching, no extra state file).
 - **Bulk follow / unfollow** — apply your choice to every username in a saved list, which is auto-discovered from the project root.
 - **Rate-limit aware** — a shared client (`ghclient.py`) sets request timeouts and automatically retries with jittered backoff on network errors, 5xx responses, and GitHub's primary/secondary rate limits (honoring `Retry-After`); transient retries are collapsed into a single end-of-run summary instead of spamming the progress bar.
 - **Quota visibility** — every harvest and follow/unfollow run prints your remaining API quota at the start and end (e.g. `API quota: 4821/5000 left (resets in ~37m)`) and warns once when it drops below the low-quota threshold, so you can see a primary rate-limit pause coming. The start reading uses GitHub's free `/rate_limit` endpoint (it doesn't consume quota); the threshold is `LOW_QUOTA_THRESHOLD` in `ghclient.py` (default 100).
-- **Pagination-aware** — follows GitHub's `Link: ... rel="next"` headers to fetch every page of followers (100 per page).
+- **Numbered pagination** — harvest pulls 100 logins per page by page number (`?page=N&per_page=100`), which is what lets pages be fetched in parallel.
 - **Progress bars** — a live `tqdm` progress bar for both harvesting and following.
 - **Randomized throttling** — each write request is followed by a random pause (default 1–2 seconds, tunable via `--min-delay`/`--max-delay`) so the request pattern looks less robotic.
 - **Dry run** — `--dry-run` previews exactly which users a follow/unfollow would affect without sending a single request.
@@ -74,7 +75,7 @@ export GITHUB_TOKEN=ghp_your_real_token_here
 Everything runs through one script. Just run it and pick what to do:
 
 ```bash
-python main.py [-o OUT] [--min-delay S] [--max-delay S] [--dry-run]
+python main.py [-o OUT] [--workers N] [--fresh] [--min-delay S] [--max-delay S] [--dry-run]
 ```
 
 ```text
@@ -94,15 +95,15 @@ Which list? [followers/following/both] [followers]: both
 - `following` → writes `<user>_following.txt`
 - `both` → writes both files
 
-Each list is paginated (100/page) and streamed one-per-line to disk as it arrives. Pass `-o OUT` to override the filename for a single list (ignored when harvesting `both`). These `*_followers.txt` / `*_following.txt` files are git-ignored — they're generated data, kept out of version control.
+Pages are fetched **in parallel** — `--workers` at a time (default 10) — and streamed one-per-line to disk as they arrive. Pass `-o OUT` to override the filename for a single list (ignored when harvesting `both`). These `*_followers.txt` / `*_following.txt` files are git-ignored — they're generated data, kept out of version control.
 
-**Resumable.** Big accounts (hundreds of thousands of followers/following) take a long time and make GitHub return intermittent `500`s. Each page is checkpointed to a sidecar `<file>.state` as it's written, so if the run stops — `Ctrl-C`, a crash, or a page that fails every retry — **just run the same harvest again and it resumes** where it left off (appending, not re-fetching). On success the `.state` file is removed and a one-line summary reports how many transient server errors were retried, e.g.:
+**Fast and resumable.** Concurrent page fetching keeps a big harvest pinned against GitHub's rate limit (≈5,000 requests/hour) rather than crawling one slow page at a time. Even so, a million-entry account is a multi-hour job and GitHub returns intermittent `500`s on deep pages (retried automatically). The output file is its own checkpoint — one username per line — so if the run stops (`Ctrl-C`, a crash, or a page that fails every retry), **just run the same harvest again and it resumes** from `lines ÷ 100 + 1` (appending, not re-fetching). A one-line summary reports how many transient server errors were retried, e.g.:
 
 ```text
 Saved 312900 usernames to torvalds_following.txt (recovered from 47 transient server errors)
 ```
 
-Use `--fresh` to ignore saved progress and start the list over.
+Tune concurrency with `--workers N` (raise it for more speed, lower it if you hit secondary rate limits); use `--fresh` to ignore saved progress and start the list over.
 
 > **Heads-up on huge accounts:** GitHub's followers/following endpoints degrade on very deep pagination, so an account with, say, 500k+ following may not be fully retrievable via the REST API at all — resume gets you as far as reliably possible. Also, a crash can leave up to ~100 duplicate usernames at the resume seam; this is harmless, since `follow`/`unfollow` de-duplicate the list when reading it.
 
