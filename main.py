@@ -300,7 +300,12 @@ def _harvest_one_graphql(session, user, kind, total, outfile, fresh=False):
                 data = ghclient.graphql(session, query,
                                         {"login": user, "cursor": cursor},
                                         on_retry=retries)
-                conn = (data.get("user") or {}).get(kind)
+                node = data.get("user")
+                if node is None:
+                    raise ghclient.GraphQLError(
+                        f"'{user}' is not a GraphQL-accessible user "
+                        f"(an organization or a nonexistent login?)")
+                conn = node.get(kind)
                 if conn is None:
                     raise ghclient.GraphQLError(f"no {kind} connection for '{user}'")
                 logins = [n["login"] for n in conn["nodes"] if n]
@@ -346,6 +351,14 @@ def harvest(args):
     except requests.exceptions.HTTPError as exc:
         sys.exit(f"Could not fetch '{user}': {exc}")
 
+    # GraphQL's user(login:) resolves only User nodes, and the Organization type
+    # has no followers/following connection — so orgs can only be harvested over
+    # REST. Fall back transparently rather than failing.
+    use_graphql = args.graphql and profile.get("type") != "Organization"
+    if args.graphql and not use_graphql:
+        print(f"{user} is an organization — GraphQL has no org-followers API; "
+              f"using the REST harvester.")
+
     # Route retry/quota notices through the bar so they don't corrupt it.
     previous_log = ghclient.log
     ghclient.log = tqdm.write
@@ -353,14 +366,14 @@ def harvest(args):
         # The free /rate_limit endpoint reports the REST core budget; under
         # --graphql the relevant budget is GraphQL points, surfaced by the
         # end-of-run summary instead.
-        if not args.graphql:
+        if not use_graphql:
             start = ghclient.get_rate_limit(session)
             if start:
                 print(start)
         for list_kind in kinds:
             outfile = args.out if (args.out and kind != "both") else f"{user}_{list_kind}.txt"
             total = profile.get(list_kind, 0)
-            if args.graphql:
+            if use_graphql:
                 rc = _harvest_one_graphql(session, user, list_kind, total,
                                           outfile, fresh=args.fresh)
             else:

@@ -119,6 +119,7 @@ Trade-offs vs. the default REST harvester:
 - **Sequential**, not parallel (each page's cursor depends on the previous), so `--workers` doesn't apply — but it's still bounded by GitHub's ~5,000-points/hour budget, so a 1M list is a similar multi-hour job.
 - Resume uses an opaque-cursor checkpoint in a `<file>.gqlstate` sidecar (the cursors can't be derived from line count, so it can't continue a REST-built file — run it on its own file, or pass `--fresh` to rebuild).
 - It silently drops suspended/deleted accounts (they come back as empty nodes), so the count can be a hair below the REST count — those accounts can't be followed anyway.
+- **User accounts only.** GitHub's GraphQL API has no followers/following connection for *organizations*, so `--graphql` on an org (e.g. `laravel`) automatically falls back to the REST harvester with a notice.
 
 Reach for `--graphql` only when REST actually hits the wall on a huge account; for everything else the parallel REST harvester is faster.
 
