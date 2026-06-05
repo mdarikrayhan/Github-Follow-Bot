@@ -10,6 +10,7 @@ The follow/unfollow lists are discovered automatically from the project root
 (any ``*_followers.txt`` or ``*_following.txt`` file).
 """
 import argparse
+import json
 import os
 import random
 import re
@@ -29,7 +30,7 @@ TARGETS_PATTERN = re.compile(r".+_follow(?:ers|ing)\.txt$")
 # Concurrent page fetches during harvest. GitHub's followers/following lists
 # support numbered pagination, so pages can be pulled in parallel rather than
 # one-at-a-time — the difference between latency-bound and rate-limit-bound.
-HARVEST_WORKERS = 10
+HARVEST_WORKERS = 25
 
 
 # --------------------------------------------------------------------------- #
@@ -187,10 +188,146 @@ def _harvest_one(session, user, kind, total, outfile, fresh=False, workers=HARVE
               file=sys.stderr)
         return 130
     if error is not None:
-        print(f"\nStopped after an API error ({error}); re-run to resume {kind} "
+        msg = (f"\nStopped after an API error ({error}); re-run to resume {kind} "
+               f"from {saved} ({outfile}).")
+        status = getattr(getattr(error, "response", None), "status_code", None)
+        if status and status >= 500:
+            msg += ("\nGitHub's REST API keeps 500ing on deep pages — you've hit its "
+                    "offset-pagination wall. Re-running REST won't get past it. "
+                    "Re-run with  --graphql --fresh  to harvest via cursor "
+                    "pagination, which seeks instead of scanning offsets.")
+        print(msg, file=sys.stderr)
+        return 1
+
+    summary = f"Saved {saved} usernames to {outfile}"
+    if retries.count:
+        summary += f" (recovered from {retries.count} transient server errors)"
+    print(summary)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# GraphQL harvest backend — cursor pagination, avoids REST's deep-offset wall
+# --------------------------------------------------------------------------- #
+GQL_QUERY = """
+query($login: String!, $cursor: String) {
+  user(login: $login) {
+    %s(first: 100, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes { login }
+    }
+  }
+}
+"""
+
+
+def _read_gql_state(path):
+    """Return the GraphQL checkpoint dict, or None if absent/unreadable."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def _write_gql_state(path, cursor, saved, done=False):
+    """Atomically checkpoint the GraphQL cursor + count + done flag."""
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump({"cursor": cursor, "saved": saved, "done": done}, handle)
+    os.replace(tmp, path)
+
+
+def _truncate_lines(path, n):
+    """Keep only the first `n` lines of `path` (drop an un-checkpointed tail)."""
+    tmp = f"{path}.tmp"
+    with open(path, encoding="utf-8") as src, open(tmp, "w", encoding="utf-8") as dst:
+        for i, line in enumerate(src):
+            if i >= n:
+                break
+            dst.write(line)
+    os.replace(tmp, path)
+
+
+def _harvest_one_graphql(session, user, kind, total, outfile, fresh=False):
+    """Harvest one list via GraphQL cursor pagination (sequential).
+
+    GraphQL keyset cursors seek by (timestamp, id) instead of scanning offsets,
+    so they avoid REST's deep-offset 500 wall. Cursors are opaque, so resume
+    uses a `<outfile>.gqlstate` sidecar holding the last cursor + count.
+    """
+    statefile = f"{outfile}.gqlstate"
+    state = _read_gql_state(statefile)
+    cursor, saved = None, 0
+
+    if fresh:
+        _remove(outfile)
+        _remove(statefile)
+    elif state is not None:
+        if state.get("done"):
+            print(f"\n{outfile} already has {int(state.get('saved', 0))} {kind} "
+                  f"(complete) — nothing to do.")
+            return 0
+        cursor = state.get("cursor")
+        saved = int(state.get("saved", 0))
+        existing = _count_lines(outfile)
+        if existing < saved:
+            sys.exit(f"{outfile} has {existing} lines but its checkpoint says "
+                     f"{saved} — out of sync. Re-run with --fresh to rebuild.")
+        if existing > saved:
+            _truncate_lines(outfile, saved)  # drop tail written after last checkpoint
+    elif _count_lines(outfile) > 0:
+        sys.exit(f"{outfile} already exists but has no GraphQL checkpoint — it was "
+                 f"likely built by the default (REST) harvester, which resumes "
+                 f"differently. Re-run with --fresh to rebuild it via GraphQL, or "
+                 f"move it aside.")
+
+    if saved:
+        print(f"\nResuming {user}'s {kind} from {saved} already saved → "
+              f"{outfile} (GraphQL)...")
+    else:
+        print(f"\n{user} has {total} {kind}, fetching to {outfile} "
+              f"(GraphQL, sequential)...")
+
+    query = GQL_QUERY % kind
+    retries = _Counter()
+    error = None
+    interrupted = False
+    try:
+        with open(outfile, "a", encoding="utf-8") as handle, \
+                tqdm(total=total, initial=saved, unit="user") as bar:
+            while True:
+                data = ghclient.graphql(session, query,
+                                        {"login": user, "cursor": cursor},
+                                        on_retry=retries)
+                conn = (data.get("user") or {}).get(kind)
+                if conn is None:
+                    raise ghclient.GraphQLError(f"no {kind} connection for '{user}'")
+                logins = [n["login"] for n in conn["nodes"] if n]
+                handle.write("".join(login + "\n" for login in logins))
+                handle.flush()
+                saved += len(logins)
+                bar.update(len(logins))
+                page = conn["pageInfo"]
+                cursor = page["endCursor"]
+                _write_gql_state(statefile, cursor, saved)
+                if not page["hasNextPage"]:
+                    break
+    except KeyboardInterrupt:
+        interrupted = True
+    except (ghclient.GraphQLError, requests.exceptions.HTTPError) as exc:
+        error = exc
+
+    if interrupted:
+        print(f"\nStopped — re-run to resume {kind} from {saved} ({outfile}).",
+              file=sys.stderr)
+        return 130
+    if error is not None:
+        print(f"\nStopped after a GraphQL error ({error}); re-run to resume {kind} "
               f"from {saved} ({outfile}).", file=sys.stderr)
         return 1
 
+    _write_gql_state(statefile, cursor, saved, done=True)  # mark complete; re-runs no-op
     summary = f"Saved {saved} usernames to {outfile}"
     if retries.count:
         summary += f" (recovered from {retries.count} transient server errors)"
@@ -213,13 +350,22 @@ def harvest(args):
     previous_log = ghclient.log
     ghclient.log = tqdm.write
     try:
-        start = ghclient.get_rate_limit(session)
-        if start:
-            print(start)
+        # The free /rate_limit endpoint reports the REST core budget; under
+        # --graphql the relevant budget is GraphQL points, surfaced by the
+        # end-of-run summary instead.
+        if not args.graphql:
+            start = ghclient.get_rate_limit(session)
+            if start:
+                print(start)
         for list_kind in kinds:
             outfile = args.out if (args.out and kind != "both") else f"{user}_{list_kind}.txt"
-            rc = _harvest_one(session, user, list_kind, profile.get(list_kind, 0),
-                              outfile, fresh=args.fresh, workers=args.workers)
+            total = profile.get(list_kind, 0)
+            if args.graphql:
+                rc = _harvest_one_graphql(session, user, list_kind, total,
+                                          outfile, fresh=args.fresh)
+            else:
+                rc = _harvest_one(session, user, list_kind, total, outfile,
+                                  fresh=args.fresh, workers=args.workers)
             if rc != 0:
                 return rc
     finally:
@@ -351,6 +497,10 @@ def parse_args(argv=None):
     parser.add_argument(
         "--workers", type=int, default=HARVEST_WORKERS,
         help="concurrent page fetches during harvest (default: %(default)s)")
+    parser.add_argument(
+        "--graphql", action="store_true",
+        help="harvest via the GraphQL API (cursor pagination, sequential) to get "
+             "past REST's deep-offset 500 wall on very large lists")
     parser.add_argument(
         "--min-delay", type=float, default=1.0,
         help="minimum seconds to wait between follow/unfollow requests (default: %(default)s)")

@@ -22,6 +22,7 @@ This project is published **for educational purposes only**. Use it on **your ow
 - **Rate-limit aware** — a shared client (`ghclient.py`) sets request timeouts and automatically retries with jittered backoff on network errors, 5xx responses, and GitHub's primary/secondary rate limits (honoring `Retry-After`); transient retries are collapsed into a single end-of-run summary instead of spamming the progress bar.
 - **Quota visibility** — every harvest and follow/unfollow run prints your remaining API quota at the start and end (e.g. `API quota: 4821/5000 left (resets in ~37m)`) and warns once when it drops below the low-quota threshold, so you can see a primary rate-limit pause coming. The start reading uses GitHub's free `/rate_limit` endpoint (it doesn't consume quota); the threshold is `LOW_QUOTA_THRESHOLD` in `ghclient.py` (default 100).
 - **Numbered pagination** — harvest pulls 100 logins per page by page number (`?page=N&per_page=100`), which is what lets pages be fetched in parallel.
+- **GraphQL fallback (`--graphql`)** — REST offset pagination hits a deep-page `500` wall around ~1M entries; `--graphql` switches to GitHub's GraphQL API, whose keyset cursors seek instead of scanning offsets, getting past that wall on giant accounts.
 - **Progress bars** — a live `tqdm` progress bar for both harvesting and following.
 - **Randomized throttling** — each write request is followed by a random pause (default 1–2 seconds, tunable via `--min-delay`/`--max-delay`) so the request pattern looks less robotic.
 - **Dry run** — `--dry-run` previews exactly which users a follow/unfollow would affect without sending a single request.
@@ -105,7 +106,23 @@ Saved 312900 usernames to torvalds_following.txt (recovered from 47 transient se
 
 Tune concurrency with `--workers N` (raise it for more speed, lower it if you hit secondary rate limits); use `--fresh` to ignore saved progress and start the list over.
 
-> **Heads-up on huge accounts:** GitHub's followers/following endpoints degrade on very deep pagination, so an account with, say, 500k+ following may not be fully retrievable via the REST API at all — resume gets you as far as reliably possible. Also, a crash can leave up to ~100 duplicate usernames at the resume seam; this is harmless, since `follow`/`unfollow` de-duplicate the list when reading it.
+#### `--graphql` — for accounts past the REST wall (~1M+)
+
+REST pagination is **offset-based** (`page=N`): at very deep pages (~page 9,800 / ~980k entries) GitHub's backend has to scan-and-discard ~1M rows per request and times out → persistent `500`s. No amount of retrying gets past it. The `--graphql` flag switches harvest to GitHub's **GraphQL API**, which uses **keyset cursors** (it seeks directly by `(timestamp, id)` instead of scanning offsets) and so isn't subject to the same deep-offset wall:
+
+```bash
+python main.py --graphql          # then: harvest → <user> → following
+```
+
+Trade-offs vs. the default REST harvester:
+
+- **Sequential**, not parallel (each page's cursor depends on the previous), so `--workers` doesn't apply — but it's still bounded by GitHub's ~5,000-points/hour budget, so a 1M list is a similar multi-hour job.
+- Resume uses an opaque-cursor checkpoint in a `<file>.gqlstate` sidecar (the cursors can't be derived from line count, so it can't continue a REST-built file — run it on its own file, or pass `--fresh` to rebuild).
+- It silently drops suspended/deleted accounts (they come back as empty nodes), so the count can be a hair below the REST count — those accounts can't be followed anyway.
+
+Reach for `--graphql` only when REST actually hits the wall on a huge account; for everything else the parallel REST harvester is faster.
+
+> **Heads-up on huge accounts:** even GraphQL is bounded by GitHub's rate limits and a multi-hour runtime for a million-entry list. On the REST harvester, a crash can also leave up to ~100 duplicate usernames at the resume seam; this is harmless, since `follow`/`unfollow` de-duplicate the list when reading it.
 
 ### follow / unfollow — act on a list
 

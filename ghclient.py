@@ -12,6 +12,7 @@ import requests
 from dotenv import load_dotenv
 
 API_BASE = "https://api.github.com"
+GRAPHQL_URL = f"{API_BASE}/graphql"
 API_VERSION = "2022-11-28"
 
 # Connect / read timeout (seconds) applied to every request.
@@ -192,6 +193,48 @@ def request(session, method, url, *, max_retries=MAX_RETRIES, on_retry=None, **k
         return response
 
     return response
+
+
+class GraphQLError(RuntimeError):
+    """A non-retryable GraphQL error (bad query, NOT_FOUND, auth, ...)."""
+
+
+def graphql(session, query, variables=None, *, max_retries=MAX_RETRIES, on_retry=None):
+    """POST a GraphQL query and return its ``data`` dict.
+
+    Transport failures (network, 5xx, HTTP 429) are retried by ``request``. A
+    GraphQL ``RATE_LIMITED`` error arrives as an HTTP 200 with an ``errors``
+    entry, so it's handled here: wait for the reset and retry. Any other GraphQL
+    error raises ``GraphQLError``.
+    """
+    payload = {"query": query, "variables": variables or {}}
+    for attempt in range(1, max_retries + 1):
+        response = request(session, "POST", GRAPHQL_URL, json=payload,
+                           max_retries=max_retries, on_retry=on_retry)
+        response.raise_for_status()
+        try:
+            body = response.json()
+        except ValueError:
+            raise GraphQLError("GraphQL response was not JSON")
+
+        errors = body.get("errors")
+        if errors:
+            if (any(e.get("type") == "RATE_LIMITED" for e in errors)
+                    and attempt < max_retries):
+                wait = _retry_after_seconds(response)
+                if wait is None:
+                    reset = _rate.get("reset")
+                    wait = max(0, int(reset) - int(time.time())) if reset else 60
+                _sleep(wait + 1, "GraphQL rate limited")
+                continue
+            raise GraphQLError("; ".join(e.get("message", str(e)) for e in errors))
+
+        data = body.get("data")
+        if data is None:
+            raise GraphQLError("GraphQL response contained no data")
+        return data
+
+    raise GraphQLError("GraphQL request still rate-limited after retries")
 
 
 def get_rate_limit(session):

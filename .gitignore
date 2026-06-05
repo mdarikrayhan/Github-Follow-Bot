@@ -186,4 +186,5 @@ cython_debug/
 
 # Harvest resume checkpoints (sidecar state files)
 *.state
+*.gqlstate
 *.state.tmp
